@@ -76,6 +76,9 @@ import comfy.text_encoders.gemma4
 import comfy.text_encoders.cogvideo
 import comfy.text_encoders.sa3
 import comfy.text_encoders.gpt_oss
+import comfy.text_encoders.moss_image
+import comfy.text_encoders.minimax
+import comfy.text_encoders.minimax_music
 
 import comfy.model_patcher
 import comfy.lora
@@ -87,6 +90,9 @@ import comfy.taesd.taehv
 import comfy.latent_formats
 
 import comfy.ldm.flux.redux
+
+import comfy.ldm.minimax.vae
+import comfy.ldm.minimax.audio_vae
 
 def load_lora_for_models(model, clip, lora, strength_model, strength_clip, lora_metadata=None):
     key_map = {}
@@ -855,7 +861,14 @@ class VAE:
                 self.upscale_index_formula = (4, 16, 16)
                 self.downscale_ratio = (lambda a: max(0, math.floor((a + 3) / 4)), 16, 16)
                 self.downscale_index_formula = (4, 16, 16)
-                if self.latent_channels in [48, 128]: # Wan 2.2 and LTX2
+                if self.latent_channels == 24 and sd["decoder.22.bias"].shape[0] == 12: # MiniMax H3
+                    self.first_stage_model = comfy.taesd.taehv.TAEHV(latent_channels=self.latent_channels, latent_format=None)
+                    self.process_input = self.process_output = lambda image: image
+                    self.upscale_ratio = (lambda a: max(1, (a - 2) // 5 * 17 + 5), 16, 16)
+                    self.downscale_ratio = (lambda a: max(1, (a - 1) // 17 * 5 + 2) if a > 1 else 1, 16, 16)
+                    self.memory_used_encode = lambda shape, dtype: (400 * ((shape[-3] + 16) // 17) * shape[-2] * shape[-1] * model_management.dtype_size(dtype))
+                    self.memory_used_decode = lambda shape, dtype: ((260 * 16 * 16 + shape[1] * shape[-3]) * shape[-2] * shape[-1] * model_management.dtype_size(dtype))
+                elif self.latent_channels in [48, 128]: # Wan 2.2 and LTX2
                     self.first_stage_model = comfy.taesd.taehv.TAEHV(latent_channels=self.latent_channels, latent_format=None) # taehv doesn't need scaling
                     self.process_input = self.process_output = lambda image: image
                     self.process_output = lambda image: image
@@ -922,6 +935,69 @@ class VAE:
                 #Force cast it for --disable-dynamic-vram users until there is a true core fix.
                 if not comfy.memory_management.aimdo_enabled:
                     self.disable_offload = True
+            elif "decoder.transformer_blocks.0.scale1" in sd or "encoder.down.5.block.0.nin_shortcut.weight" in sd:  # MiniMax H3 video VAE, or just its decoder / encoder
+                minimax_ops = comfy.ops.disable_weight_init
+                minimax_quant = comfy.utils.detect_layer_quantization(sd, "")
+                if minimax_quant is not None:  # int8+convrot quantized decoder
+                    minimax_ops = comfy.ops.mixed_precision_ops(minimax_quant, dtype if dtype is not None else torch.float16)
+                minimax_layers = sum(k.startswith("decoder.transformer_blocks.") and k.endswith(".scale1") for k in sd)
+                still_frame = None
+                if metadata is not None and metadata.get("h3_t1_direct") == "true":  # decoder fine-tuned for single-latent stills
+                    still_frame = int(metadata.get("h3_t1_output_slice", 3))
+                # LightVAE Lite encoders prune resnet blocks down to their shortcut
+                minimax_kept = {(int(k.split(".")[2]), int(k.split(".")[4])) for k in sd if k.startswith("encoder.down.") and k.endswith(".conv1.weight")}
+                self.first_stage_model = comfy.ldm.minimax.vae.MiniMaxH3VideoVAE(operations=minimax_ops, num_layers=minimax_layers, still_frame=still_frame, encoder_kept_blocks=minimax_kept, encoder="encoder.conv_in.weight" in sd, decoder=minimax_layers > 0)
+                self.latent_channels = 24
+                self.latent_dim = 3
+                # frames 17k+5 <-> latents 5k+2, 16x spatial
+                self.upscale_ratio = (lambda a: max(1, (a - 2) // 5 * 17 + 5), 16, 16)
+                self.upscale_index_formula = (4, 16, 16)
+                self.downscale_ratio = (lambda a: max(1, (a - 5) // 17 * 5 + 2) if a > 1 else 1, 16, 16)
+                self.downscale_index_formula = (4, 16, 16)
+                self.working_dtypes = [torch.float16, torch.float32]
+                # the model tiles internally (256px spatial, 17-frame temporal chunks)
+                self.handles_tiling = True
+                # decode finalizes straight to [0, 1] while streaming chunks out
+                self.process_output = lambda image: image
+                # one decoded temporal chunk (with overlap) is all that ever sits in VRAM
+                chunk_frames = (self.first_stage_model.tokens_chunk_size + self.first_stage_model.token_overlap) * self.first_stage_model.vae_ratio_t
+
+                def estimate_encode_memory(frames, height, width, dtype):
+                    fixed = 110_000_000 if frames == 1 else 1_300_000_000
+                    elements_per_pixel = 7 if frames == 1 else 9.5
+                    # only one clip of the input video is ever resident on the GPU
+                    frames = min(frames, self.first_stage_model.clip_length)
+                    return (elements_per_pixel * frames * height * width + fixed) * model_management.dtype_size(dtype) * 1.03
+
+                def estimate_decode_memory(frames, height, width, dtype):
+                    # the stock decoder decodes a still as a full clip of copies, so it needs a clip's activations
+                    fixed = 150_000_000 if frames == 1 and still_frame is None else 110_000_000 if frames <= 22 else 270_000_000
+                    frames = min(frames, chunk_frames + 2)
+                    return (9.5 * frames * height * width + fixed) * model_management.dtype_size(dtype) * 1.03
+
+                self.memory_used_encode = lambda shape, dtype: estimate_encode_memory(shape[2], shape[3], shape[4], dtype)
+                self.memory_used_decode = lambda shape, dtype: estimate_decode_memory(self.upscale_ratio[0](shape[2]), shape[3] * self.upscale_ratio[1], shape[4] * self.upscale_ratio[2], dtype)
+            elif "pre_block.attn.zero_k_bias" in sd:  # MiniMax H3 audio VAE (DAC encoder + BigVGAN decoder)
+                self.first_stage_model = comfy.ldm.minimax.audio_vae.MiniMaxH3AudioVAE()
+                self.latent_channels = 32
+                self.output_channels = 2
+                self.pad_channel_value = "replicate"
+                self.audio_sample_rate = 32000
+                self.upscale_ratio = 800
+                self.downscale_ratio = 800
+                self.latent_dim = 2  # [B, 32, stereo 2, T]
+                self.process_output = lambda audio: audio
+                self.process_input = lambda audio: audio
+                self.working_dtypes = [torch.float32]
+                # encode gets the waveform shape [B, 2, samples], decode the latent shape [B, 32, 2, T]
+                def estimate_encode_memory(samples, dtype):
+                    return (900 * samples + 105_000_000) * model_management.dtype_size(dtype) * 1.03
+
+                def estimate_decode_memory(samples, dtype):
+                    return max(42_000_000, 220 * samples + 20_000_000) * model_management.dtype_size(dtype) * 1.03
+
+                self.memory_used_encode = lambda shape, dtype: estimate_encode_memory(shape[2], dtype)
+                self.memory_used_decode = lambda shape, dtype: estimate_decode_memory(shape[-1] * self.upscale_ratio, dtype)
             elif "gs.base_offset_scale" in sd and "octree.out_proj.weight" in sd:  # TripoSplat octree gaussian decoder
                 self.first_stage_model = comfy.ldm.triposplat.vae.OctreeGaussianDecoder()
                 self.latent_channels = 16
@@ -1377,6 +1453,8 @@ class CLIPType(Enum):
     IDEOGRAM4 = 30
     BOOGU = 31
     KREA2 = 32
+    MINIMAX = 35
+    MOSS_IMAGE = 38
 
 
 
@@ -1432,6 +1510,7 @@ class TEModel(Enum):
     GPT_OSS_20B = 33
     QWEN3VL_4B = 34
     QWEN3VL_8B = 35
+    QWEN3VL_32B = 37
 
 
 def detect_te_model(sd):
@@ -1495,6 +1574,9 @@ def detect_te_model(sd):
         return TEModel.QWEN35_2B
     if "model.visual.deepstack_merger_list.0.norm.weight" in sd:  # DeepStack is unique to Qwen3-VL
         return TEModel.QWEN3VL_4B if sd["model.visual.merger.linear_fc2.weight"].shape[0] == 2560 else TEModel.QWEN3VL_8B
+    if "visual.deepstack_merger_list.0.norm.weight" in sd and "model.layers.49.self_attn.q_proj.weight" in sd:
+        # MiniMax H3 conditioning encoder: Qwen3-VL-32B, truncated to 50 layers
+        return TEModel.QWEN3VL_32B
     if "model.layers.0.post_attention_layernorm.weight" in sd:
         weight = sd['model.layers.0.post_attention_layernorm.weight']
         if 'model.layers.0.self_attn.q_norm.weight' in sd:
@@ -1558,7 +1640,16 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
     clip_target.params = {}
     if len(clip_data) == 1:
         te_model = detect_te_model(clip_data[0])
-        if te_model == TEModel.CLIP_G:
+        if clip_type == CLIPType.MINIMAX and "model.audio_decoder.projection.weight" in clip_data[0]:
+            tokenizer_data["tokenizer_json"] = clip_data[0].pop("tokenizer_json", None)
+            quant = comfy.utils.detect_layer_quantization(clip_data[0], "")
+            if quant is not None:
+                model_options = model_options.copy()
+                model_options["quantization_metadata"] = quant
+            clip_target.params["projection_config"] = comfy.text_encoders.minimax_music.detect_merged_config(clip_data[0])
+            clip_target.clip = comfy.text_encoders.minimax_music.MiniMaxMusic3TEModel
+            clip_target.tokenizer = comfy.text_encoders.minimax_music.MiniMaxMusic3Tokenizer
+        elif te_model == TEModel.CLIP_G:
             if clip_type == CLIPType.STABLE_CASCADE:
                 clip_target.clip = sdxl_clip.StableCascadeClipModel
                 clip_target.tokenizer = sdxl_clip.StableCascadeTokenizer
@@ -1690,9 +1781,13 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
             clip_target.tokenizer = comfy.text_encoders.jina_clip_2.JinaClip2TokenizerWrapper
         elif te_model in (TEModel.QWEN35_08B, TEModel.QWEN35_2B, TEModel.QWEN35_4B, TEModel.QWEN35_9B, TEModel.QWEN35_27B):
             clip_data[0] = comfy.utils.state_dict_prefix_replace(clip_data[0], {"model.language_model.": "model.", "model.visual.": "visual.", "lm_head.": "model.lm_head."})
-            qwen35_type = {TEModel.QWEN35_08B: "qwen35_08b", TEModel.QWEN35_2B: "qwen35_2b", TEModel.QWEN35_4B: "qwen35_4b", TEModel.QWEN35_9B: "qwen35_9b", TEModel.QWEN35_27B: "qwen35_27b"}[te_model]
-            clip_target.clip = comfy.text_encoders.qwen35.te(**llama_detect(clip_data), model_type=qwen35_type)
-            clip_target.tokenizer = comfy.text_encoders.qwen35.tokenizer(model_type=qwen35_type)
+            if clip_type == CLIPType.MOSS_IMAGE and te_model == TEModel.QWEN35_9B:  # MOSS-Image: stock Qwen3.5-9B, last hidden state, open think block.
+                clip_target.clip = comfy.text_encoders.moss_image.te(**llama_detect(clip_data))
+                clip_target.tokenizer = comfy.text_encoders.moss_image.MOSSImageTokenizer
+            else:
+                qwen35_type = {TEModel.QWEN35_08B: "qwen35_08b", TEModel.QWEN35_2B: "qwen35_2b", TEModel.QWEN35_4B: "qwen35_4b", TEModel.QWEN35_9B: "qwen35_9b", TEModel.QWEN35_27B: "qwen35_27b"}[te_model]
+                clip_target.clip = comfy.text_encoders.qwen35.te(**llama_detect(clip_data), model_type=qwen35_type, mtp="mtp.fc.weight" in clip_data[0])
+                clip_target.tokenizer = comfy.text_encoders.qwen35.tokenizer(model_type=qwen35_type)
         elif te_model in (TEModel.QWEN3VL_4B, TEModel.QWEN3VL_8B):
             if clip_type == CLIPType.IDEOGRAM4 and te_model == TEModel.QWEN3VL_8B:  # Ideogram4 reuses the full Qwen3-VL-8B (13-layer tap for conditioning + multimodal generate).
                 clip_data[0] = comfy.utils.state_dict_prefix_replace(clip_data[0], {"model.language_model.": "model.", "model.visual.": "visual.", "lm_head.": "model.lm_head."})
@@ -1715,6 +1810,9 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
                 qwen3vl_type = {TEModel.QWEN3VL_4B: "qwen3vl_4b", TEModel.QWEN3VL_8B: "qwen3vl_8b"}[te_model]
                 clip_target.clip = comfy.text_encoders.qwen3vl.te(**llama_detect(clip_data), model_type=qwen3vl_type)
                 clip_target.tokenizer = comfy.text_encoders.qwen3vl.tokenizer(model_type=qwen3vl_type)
+        elif te_model == TEModel.QWEN3VL_32B:
+            clip_target.clip = comfy.text_encoders.minimax.te(**llama_detect(clip_data))
+            clip_target.tokenizer = comfy.text_encoders.minimax.MiniMaxH3Tokenizer
         elif te_model == TEModel.QWEN3_06B:
             clip_target.clip = comfy.text_encoders.anima.te(**llama_detect(clip_data))
             clip_target.tokenizer = comfy.text_encoders.anima.AnimaTokenizer

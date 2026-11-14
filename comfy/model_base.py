@@ -70,6 +70,7 @@ import comfy.ldm.sam3.detector
 import comfy.ldm.hidream_o1.model
 from comfy.ldm.hidream_o1.conditioning import build_extra_conds
 import comfy.ldm.depth_anything_3.model
+import comfy.ldm.moss_image.model
 
 import comfy.model_management
 import comfy.patcher_extension
@@ -902,6 +903,17 @@ class StableAudio3(BaseModel):
             sd["conditioner.conditioners.prompt.padding_embedding"] = self.padding_embedding.data
         return sd
 
+class MOSSImage(BaseModel):
+    def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
+        super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.moss_image.model.MOSSImage)
+
+    def extra_conds(self, **kwargs):
+        out = super().extra_conds(**kwargs)
+        cross_attn = kwargs.get("cross_attn", None)
+        # rope positions follow the true text length, so no repeat padding: cond and uncond of different lengths run separately
+        if cross_attn is not None:
+            out['c_crossattn'] = comfy.conds.CONDRegular(cross_attn)
+        return out
 
 class HunyuanDiT(BaseModel):
     def __init__(self, model_config, model_type=ModelType.V_PREDICTION, device=None):

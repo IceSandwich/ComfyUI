@@ -67,6 +67,50 @@ def get_attention_function(name: str, default: Any=...) -> Union[Callable, None]
             return default
     return REGISTERED_ATTENTION_FUNCTIONS[name]
 
+from comfy.configurable import ConfigurableModule
+import json
+import comfy_kitchen
+class ComfyAttention(ConfigurableModule):
+    def __init__(self):
+        super().__init__()
+        self.config = None
+        self.function = None
+        self.method = None
+
+    def with_config(self, encoded_config):
+        attention = ComfyAttention()
+        attention.load_state_dict({"config": encoded_config})
+        return attention
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        self.config = None
+        self.function = None
+        self.method = None
+        metadata = state_dict.pop(prefix + "config", None)
+        if metadata is not None:
+            self.config = json.loads(metadata.numpy().tobytes())
+            configs = self.config if isinstance(self.config, list) else [self.config]
+            for config in configs:
+                method = config.get("attention")
+                if method == "comfy_kitchen_int8":
+                    if COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE and comfy_kitchen.int8_attention_is_available(model_management.get_torch_device()):
+                        self.function = attention_comfy_kitchen_int8
+                elif method == "comfy_kitchen_sol":
+                    if comfy_kitchen.sol_attn_is_available(model_management.get_torch_device()):
+                        self.function = functools.partial(attention_comfy_kitchen_sol, tau=config.get("tau", 1.0))
+                else:
+                    logging.warning(f"Ignoring unknown attention method {method!r} for {prefix.rstrip('.')}")
+                if self.function is not None:
+                    self.method = method
+                    break
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if self.config is not None:
+            destination[prefix + "config"] = torch.tensor(list(json.dumps(self.config).encode("utf-8")), dtype=torch.uint8)
+
+
 from comfy.cli_args import args
 import comfy.ops
 ops = comfy.ops.disable_weight_init
@@ -162,6 +206,24 @@ class FeedForward(nn.Module):
 def Normalize(in_channels, dtype=None, device=None):
     return torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True, dtype=dtype, device=device)
 
+
+class AttentionTensorContainer:
+    """Single-owner tensor input consumed by an optimized attention backend."""
+
+    __slots__ = ("tensor",)
+
+    def __init__(self, tensor: torch.Tensor):
+        self.tensor: torch.Tensor | None = tensor
+
+    def peek(self) -> torch.Tensor:
+        if self.tensor is None:
+            raise RuntimeError("attention tensor container has already been consumed")
+        return self.tensor
+
+    def take(self) -> torch.Tensor:
+        tensor = self.peek()
+        self.tensor = None
+        return tensor
 
 def wrap_attn(func):
     @functools.wraps(func)

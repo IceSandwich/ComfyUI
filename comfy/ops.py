@@ -628,6 +628,9 @@ class disable_weight_init:
         def reset_parameters(self):
             self.bias = None
             return None
+        
+        def cast_weight(self, input):
+            return CastBiasWeightContext(self if self.weight is not None else None, input, offloadable=True)
 
         def forward_comfy_cast_weights(self, input):
             if self.weight is not None:
@@ -898,15 +901,153 @@ if CUBLAS_IS_AVAILABLE:
                 else:
                     return super().forward(*args, **kwargs)
 
+class CastBiasWeightContext:
+    # When initialized with no arguments or the first is None, the context
+    # will return the tuple (None, None).
+    def __init__(self, *args, **kwargs):
+        self.slf = args[0] if len(args) else None
+        self.state = (None, None) if self.slf is None else cast_bias_weight(*args, **kwargs)
+
+    def __enter__(self):
+        result = self.state
+        if len(result) < 3 or result[2] is None:
+            # Not offloaded, immediately drop references.
+            self.state = self.slf = None
+        return result[:2]
+
+    def __exit__(self, *_args) -> None:
+        if self.slf is None:
+            return
+        slf, state = self.slf, self.state
+        self.state = self.slf = None
+        uncast_bias_weight(slf, *state)
+
+
 # ==============================================================================
 # Mixed Precision Operations
 # ==============================================================================
+from . import quant_ops
 from .quant_ops import (
     QuantizedTensor,
     QUANT_ALGOS,
     TensorCoreFP8Layout,
     get_layout_class,
 )
+
+def _swiglu_eager(x):
+    gate, up = x.chunk(2, dim=-1)
+    return torch.nn.functional.silu(gate).mul_(up)
+
+
+def _situ_eager(x):
+    # out of place: the training path runs through here
+    hidden, gate = x.chunk(2, dim=-1)
+    return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (25.0 * torch.tanh(hidden / 25.0))
+
+
+INPUT_ACT_EAGER = {
+    "gelu_tanh": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
+    "swiglu": _swiglu_eager,
+    "situ": _situ_eager,
+}
+
+
+@contextlib.contextmanager
+def _input_act_weight(x, input_act, act_weight, act_eps):
+    if input_act == "rms_norm" and isinstance(act_weight, torch.nn.Module):
+        with act_weight.cast_weight(x) as (weight, _):
+            eps = act_weight.eps
+            if eps is None:
+                eps = torch.finfo(torch.float64 if x.dtype == torch.float64 else torch.float32).eps
+            yield weight, eps
+    else:
+        yield act_weight, act_eps
+
+
+def _eager_input_act(x, input_act, act_weight=None, act_eps=0.0):
+    if input_act is None:
+        return x
+    if input_act == "rms_norm":
+        with _input_act_weight(x, input_act, act_weight, act_eps) as (weight, eps):
+            return comfy.rmsnorm.rms_norm(x, weight, eps)
+    return INPUT_ACT_EAGER[input_act](x)
+
+
+def _linear_residual(out, residual, residual_scale):
+    return out if residual is None else torch.addcmul(residual, out, residual_scale)
+
+
+def _fp16_linear_wanted(x):
+    """kitchen's fp16-accumulate GEMM replaces a plain linear when the user opted into
+        fp16 accumulation and the activation is fp16 on CUDA; weights come through cast_bias_weight."""
+    return (getattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False)
+            and x.dtype == torch.float16 and x.is_cuda)
+
+
+def _try_quantized_linear_input_act(x, weight, bias, input_act, act_weight, act_eps,
+                                   residual, residual_scale):
+    if comfy.model_management.in_training or not isinstance(weight, QuantizedTensor):
+        return NotImplemented
+    with _input_act_weight(x, input_act, act_weight, act_eps) as (act_weight, act_eps):
+        return weight.linear_input_act(
+            x, bias, input_act=input_act, input_act_weight=act_weight, input_act_eps=act_eps,
+            residual=residual, residual_scale=residual_scale,
+        )
+
+
+def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
+                     residual=None, residual_scale=None):
+    run_every_op()
+    weight = linear.weight
+    quantized = isinstance(weight, QuantizedTensor)
+    if (comfy.model_management.in_training or getattr(linear, "comfy_force_forward", False) or getattr(linear, "_full_precision_mm", False)
+            or not (quantized or _fp16_linear_wanted(x))):
+        out = linear(_eager_input_act(x, input_act, act_weight, act_eps))
+        return _linear_residual(out, residual, residual_scale)
+
+    with CastBiasWeightContext(linear, x, offloadable=True,
+                               compute_dtype=x.dtype if quantized else None,
+                               want_requant=quantized) as (weight, bias):
+        if not quantized:
+            return linear_input_act_(x, weight, bias, input_act, act_weight, act_eps,
+                                     residual, residual_scale)
+        out = _try_quantized_linear_input_act(x, weight, bias, input_act, act_weight, act_eps,
+                                              residual, residual_scale)
+        if out is not NotImplemented:
+            return out
+
+    # A tensor-level fallback cannot replace module-owned input processing.
+    out = linear(_eager_input_act(x, input_act, act_weight, act_eps))
+    return _linear_residual(out, residual, residual_scale)
+
+
+def linear_input_act_(x, weight, bias, input_act=None, act_weight=None, act_eps=0.0,
+                      residual=None, residual_scale=None, *, fp16_accumulation=True):
+    """``linear(act(x))`` with optional residual addcmul, fused where the weight supports it.
+
+    Linear weights are already prepared. An RMSNorm module in act_weight owns
+    its norm-weight cast context; a tensor uses the supplied act_eps directly.
+    """
+    if input_act is None and residual is None:
+        return torch.nn.functional.linear(x, weight, bias)
+
+    out = _try_quantized_linear_input_act(x, weight, bias, input_act, act_weight, act_eps,
+                                          residual, residual_scale)
+    if out is not NotImplemented:
+        return out
+    x = _eager_input_act(x, input_act, act_weight, act_eps)
+
+    if (not comfy.model_management.in_training
+            and not isinstance(weight, QuantizedTensor)
+            and fp16_accumulation and _fp16_linear_wanted(x)):
+        return quant_ops.ck.fp16_linear(x, weight, bias, residual=residual, residual_scale=residual_scale)
+
+    return _linear_residual(torch.nn.functional.linear(x, weight, bias), residual, residual_scale)
+
+
+# Grouped-scale integer weights that run through the shared INT8 GEMM (comfy_kitchen
+# AsymW4A8Int8Layout): format -> code width, which also fixes the packed weight width K*bits/8.
+_GROUPED_INT8_FORMATS = {"asym_w4a8_int8": 4, "w6a8_int8": 6}
 
 
 class QuantLinearFunc(torch.autograd.Function):
@@ -1025,6 +1166,9 @@ def _quantized_apply(module, fn, recurse=True):
             module._buffers[key] = fn(buf)
     return module
 
+# Grouped-scale integer weights that run through the shared INT8 GEMM (comfy_kitchen
+# AsymW4A8Int8Layout): format -> code width, which also fixes the packed weight width K*bits/8.
+_GROUPED_INT8_FORMATS = {"asym_w4a8_int8": 4, "w6a8_int8": 6}
 
 def _load_quantized_module(module, super_load, state_dict, prefix, local_metadata, strict,
                             missing_keys, unexpected_keys, error_msgs, load_extra_params=False):
@@ -1118,6 +1262,33 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
                 ),
                 "quant_group_size": 64,
                 "linear_dtype": layer_conf.get("linear_dtype", params_conf.get("linear_dtype", "int4")),
+            }
+        elif module.quant_format in _GROUPED_INT8_FORMATS:
+            # asym_w4a8_int8: int4 weight (packed int8 [N,K/2]) + optional Lloyd-Max codebook;
+            # w6a8_int8: uniform int6 weight (packed int8 [N,3K/4]). Both carry an fp8 per-group
+            # scale (weight_s_rel) and an fp32 per-channel scale (weight_s_channel).
+            bits = _GROUPED_INT8_FORMATS[module.quant_format]
+            if weight.shape[1] * 8 != module._orig_shape[1] * bits:
+                raise ValueError(
+                    f"{module.quant_format} layer {layer_name}: packed weight width {weight.shape[1]} "
+                    f"does not match K={module._orig_shape[1]} at {bits} bits"
+                )
+            scale = pop_scale("weight_s_rel")
+            if scale is None:
+                raise ValueError(f"Missing {module.quant_format} group scale (weight_s_rel) for layer {layer_name}")
+            if scale.dtype == torch.uint8:
+                scale = scale.view(torch.float8_e4m3fn)
+            params_conf = layer_conf.get("params", {})
+            if not isinstance(params_conf, dict):
+                params_conf = {}
+            scales = {
+                "scale": scale,
+                "s_channel": pop_scale("weight_s_channel"),
+                "codebook": pop_scale("weight_codebook"),
+                "group_size": int(layer_conf.get("group_size", params_conf.get("group_size", 16))),
+                "convrot_groupsize": int(
+                    layer_conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))
+                ),
             }
         else:
             raise ValueError(f"Unsupported quantization format: {module.quant_format}")
@@ -1217,7 +1388,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
 
             def state_dict(self, *args, destination=None, prefix="", **kwargs):
                 sd = destination if destination is not None else {}
-                return _quantized_weight_state_dict(self, sd, prefix, extra_quant_params=("input_scale",))
+                return _quantized_weight_state_dict(self, sd, prefix, extra_quant_params=("input_scale", "pre_quant_scale"))
 
             def _forward(self, input, weight, bias):
                 return torch.nn.functional.linear(input, weight, bias)
@@ -1255,6 +1426,11 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
 
             def forward(self, input, *args, **kwargs):
                 run_every_op()
+
+                # ModelOpt AWQ-style smoothing
+                pre_quant_scale = getattr(self, 'pre_quant_scale', None)
+                if pre_quant_scale is not None:
+                    input = input * comfy.model_management.cast_to_device(pre_quant_scale, input.device, input.dtype)
 
                 input_shape = input.shape
                 reshaped_nd = False
@@ -1474,7 +1650,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 quant_format = layer_conf.get("format") if layer_conf is not None else None
                 manually_loaded_keys = []
 
-                if quant_format in ("float8_e4m3fn", "float8_e5m2") and weight_key in state_dict:
+                if quant_format in ("float8_e4m3fn", "float8_e5m2", "int8_tensorwise") and weight_key in state_dict:
                     self.quant_format = quant_format
                     qconfig = QUANT_ALGOS[quant_format]
                     self.layout_type = qconfig["comfy_tensor_layout"]
@@ -1488,10 +1664,16 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                         scale = scale.float()
                         manually_loaded_keys.append(scale_key)
 
+                    extra = {}
+                    if quant_format == "int8_tensorwise" and layer_conf.get("convrot", False):
+                        # rotated embedding table: record it so the forward un-rotates after lookup
+                        extra["convrot"] = True
+                        extra["convrot_groupsize"] = int(layer_conf.get("convrot_groupsize", 256))
                     params = layout_cls.Params(
                         scale=scale if scale is not None else torch.ones((), dtype=torch.float32),
                         orig_dtype=MixedPrecisionOps._compute_dtype,
                         orig_shape=(self.num_embeddings, self.embedding_dim),
+                        **extra,
                     )
                     self.weight = torch.nn.Parameter(
                         QuantizedTensor(weight.to(dtype=qconfig["storage_t"]), qconfig["comfy_tensor_layout"], params),
@@ -1517,10 +1699,17 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 if isinstance(weight, QuantizedTensor) and len(self.weight_function) == 0:
                     qdata, _, offload_stream = cast_bias_weight(self, device=input.device, dtype=weight.dtype, offloadable=True)
                     if isinstance(qdata, QuantizedTensor):
+                        params = qdata._params
                         scale = qdata._params.scale
                         qdata = qdata._qdata
                     else:
+                        params = weight._params
                         scale = None
+
+                    # int8: per-row scale possible ConvRot, so let the layout do the gather
+                    if self.quant_format == "int8_tensorwise":
+                        x = get_layout_class(self.layout_type).dequantize_embedding(qdata, params, input)
+                        return x if out_dtype is None else x.to(dtype=out_dtype)
 
                     x = torch.nn.functional.embedding(
                         input, qdata, self.padding_idx, self.max_norm,

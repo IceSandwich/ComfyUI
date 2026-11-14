@@ -433,7 +433,6 @@ class Qwen35Transformer(Llama2_):
             mrope_section=self.config.mrope_section,
         )
 
-
 # Vision Encoder
 class Qwen35VisionPatchEmbed(nn.Module):
     def __init__(self, config, device=None, dtype=None, ops=None):
@@ -739,7 +738,8 @@ class Qwen35ImageTokenizer(sd1_clip.SD1Tokenizer):
     def tokenize_with_weights(self, text, return_word_ids=False, llama_template=None, images=[], prevent_empty_text=False, thinking=False, **kwargs):
         image = kwargs.get("image", None)
         if image is not None and len(images) == 0:
-            images = [image[i:i + 1] for i in range(image.shape[0])]
+            images = [image[i:i + 1] for i in range(image.shape[0
+                                                                ])]
 
         skip_template = False
         if text.startswith('<|im_start|>'):
