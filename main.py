@@ -546,6 +546,9 @@ def start_comfyui(asyncio_loop=None):
     # Returning these so that other code can integrate with the ComfyUI loop and server
     return asyncio_loop, prompt_server, start_all
 
+if __name__ == "__main__":
+    from ice_scripts import patch_comfy_kitchen
+    patch_comfy_kitchen.Patch()
 
 if __name__ == "__main__":
     # Running directly, just start ComfyUI.
