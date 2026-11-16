@@ -548,7 +548,7 @@ def start_comfyui(asyncio_loop=None):
 
 if __name__ == "__main__":
     from ice_scripts import patch_comfy_kitchen
-    patch_comfy_kitchen.Patch()
+    # patch_comfy_kitchen.Patch()
 
 if __name__ == "__main__":
     # Running directly, just start ComfyUI.

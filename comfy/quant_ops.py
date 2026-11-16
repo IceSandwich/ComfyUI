@@ -28,12 +28,12 @@ try:
         TensorCoreNVFP4Layout as _CKNvfp4Layout,
         TensorCoreConvRotW4A4Layout as _CKTensorCoreConvRotW4A4Layout,
         TensorWiseINT8Layout as _CKTensorWiseINT8Layout,
-        # AsymW4A8Int8Layout as _CKAsymW4A8Int8Layout,
+        AsymW4A8Int8Layout as _CKAsymW4A8Int8Layout,
         register_layout_op,
         register_layout_class,
         get_layout_class,
     )
-    from ice_scripts.comfy_kitchen_supplement.tensor.w4a8_int8 import AsymW4A8Int8Layout as _CKAsymW4A8Int8Layout
+    # from ice_scripts.comfy_kitchen_supplement.tensor.w4a8_int8 import AsymW4A8Int8Layout as _CKAsymW4A8Int8Layout
     _CK_AVAILABLE = True
     if torch.version.cuda is None:
         ck.registry.disable("cuda")
